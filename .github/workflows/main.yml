@@ -1,0 +1,160 @@
+name: "Build & Release"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+jobs:
+  build_android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          architecture: x64
+      - name: Clean Flutter build
+        run: flutter clean && flutter pub get
+      
+      - name: Build Dev APK
+        run: flutter build apk --flavor dev -t lib/main_dev.dart
+        env:
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
+      
+      - name: Build QA APK
+        run: flutter build apk --flavor qa -t lib/main_qa.dart
+        env:
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
+      
+      - name: Build Prod APK
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: flutter build apk --flavor prod -t lib/main_prod.dart
+        env:
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle
+      
+      - name: Upload Android APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 5
+
+  build_ios:
+    name: Build iOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          architecture: x64
+      - name: Clean Flutter build
+        run: flutter clean && flutter pub get
+      
+      - name: Build iOS Dev
+        run: flutter build ios -t lib/main_dev.dart --no-codesign --release
+      
+      - name: Create Dev IPA
+        run: |
+          mkdir Payload
+          cp -r build/ios/iphoneos/Runner.app Payload
+          mv Payload/Runner.app Payload/AppDev.app
+          zip -r app-dev-unsigned.ipa Payload
+          rm -rf Payload
+      
+      - name: Build iOS QA 
+        run: flutter build ios -t lib/main_qa.dart --no-codesign --release
+      
+      - name: Create QA IPA
+        run: |
+          mkdir Payload
+          cp -r build/ios/iphoneos/Runner.app Payload
+          mv Payload/Runner.app Payload/AppQA.app
+          zip -r app-qa-unsigned.ipa Payload
+          rm -rf Payload
+      
+      - name: Build iOS Prod
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: flutter build ios -t lib/main_prod.dart --no-codesign --release
+      
+      - name: Create Prod IPA
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          mkdir Payload
+          cp -r build/ios/iphoneos/Runner.app Payload
+          mv Payload/Runner.app Payload/AppProd.app
+          zip -r app-prod-unsigned.ipa Payload
+          rm -rf Payload
+      
+      - name: Upload iOS IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipas
+          path: "*.ipa"
+          retention-days: 5
+
+  create_release:
+    name: Create Release
+    needs: [build_android, build_ios]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download Android APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apks
+          path: artifacts
+      
+      - name: Download iOS IPAs
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-ipas
+          path: artifacts
+      
+      - name: Create source code archives
+        run: |
+          mkdir -p temp_source
+          rsync -a --exclude='.git' --exclude='build' --exclude='.dart_tool' --exclude='.idea' --exclude='android/.gradle' --exclude='ios/Pods' . temp_source/
+          cd temp_source
+          zip -r ../artifacts/source-code.zip .
+          tar -czf ../artifacts/source-code.tar.gz .
+          cd ..
+          rm -rf temp_source
+      
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+          if [ "$LATEST_TAG" = "none" ]; then
+            CHANGES=$(git log --pretty=format:"- %s (%h)" -10)
+          else
+            CHANGES=$(git log --pretty=format:"- %s (%h)" ${LATEST_TAG}..HEAD)
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "## Changes in v1.0.${{ github.run_number }}" >> $GITHUB_ENV
+          echo "$CHANGES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      
+      - name: Push to Releases
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "artifacts/*"
+          tag: v1.0.${{ github.run_number }}
+          token: ${{ secrets.TOKEN }}
+          body: ${{ env.CHANGELOG }}
